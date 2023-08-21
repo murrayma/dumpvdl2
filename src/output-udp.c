@@ -32,6 +32,8 @@ typedef struct {
 	char *address;
 	char *port;
 	int sockfd;
+        struct sockaddr *netaddr;
+        size_t netaddrlen;
 } out_udp_ctx_t;
 
 static bool out_udp_supports_format(output_format_t format) {
@@ -68,21 +70,27 @@ static int out_udp_init(void *selfptr) {
 	hints.ai_flags = 0;
 	hints.ai_protocol = 0;
 	int ret = getaddrinfo(self->address, self->port, &hints, &result);
+
 	if(ret != 0) {
+                if(ret == EAI_AGAIN) {
+                    fprintf(stderr, "output_udp: temporary failure resolving '%s': %s. Retrying later.\n", self->address, gai_strerror(ret));
+                    return 0;
+                }
 		fprintf(stderr, "output_udp: could not resolve %s: %s\n", self->address, gai_strerror(ret));
 		return -1;
 	}
+
 	for (rptr = result; rptr != NULL; rptr = rptr->ai_next) {
 		self->sockfd = socket(rptr->ai_family, rptr->ai_socktype, rptr->ai_protocol);
 		if(self->sockfd == -1) {
 			continue;
 		}
-		if(connect(self->sockfd, rptr->ai_addr, rptr->ai_addrlen) != -1) {
-			break;
-		}
-		close(self->sockfd);
-		self->sockfd = 0;
-	}
+                self->netaddrlen = rptr->ai_addrlen;
+                self->netaddr = malloc(rptr->ai_addrlen);
+                memcpy(self->netaddr, rptr->ai_addr, rptr->ai_addrlen);
+                break;
+        }
+
 	if (rptr == NULL) {
 		fprintf(stderr, "output_udp: Could not set up UDP socket to %s:%s: all addresses failed\n",
 				self->address, self->port);
@@ -100,7 +108,11 @@ static void out_udp_produce_pp_acars(out_udp_ctx_t *self, vdl2_msg_metadata *met
 	if(msg->len < 1) {
 		return;
 	}
-	if(write(self->sockfd, msg->buf, msg->len) < 0) {
+        if(!self->netaddrlen) {
+            /* Destination address hasn't been successfully resolved yet, so silently drop this message. */
+            return;
+        }
+	if(sendto(self->sockfd, msg->buf, msg->len, 0, self->netaddr, self->netaddrlen) < 0) {
 		debug_print(D_OUTPUT, "output_udp: error while writing to the network socket: %s", strerror(errno));
 	}
 }
@@ -112,7 +124,11 @@ static void out_udp_produce_text(out_udp_ctx_t *self, vdl2_msg_metadata *metadat
 	if(msg->len < 2) {
 		return;
 	}
-	if(write(self->sockfd, msg->buf, msg->len) < 0) {
+        if(!self->netaddrlen) {
+            /* Destination address hasn't been successfully resolved yet, so silently drop this message. */
+            return;
+        }
+	if(sendto(self->sockfd, msg->buf, msg->len, 0, self->netaddr, self->netaddrlen) < 0) {
 		debug_print(D_OUTPUT, "output_udp: error while writing to the network socket: %s", strerror(errno));
 	}
 }
@@ -120,6 +136,12 @@ static void out_udp_produce_text(out_udp_ctx_t *self, vdl2_msg_metadata *metadat
 static int out_udp_produce(void *selfptr, output_format_t format, vdl2_msg_metadata *metadata, octet_string_t *msg) {
 	ASSERT(selfptr != NULL);
 	out_udp_ctx_t *self = selfptr;
+
+        if(!self->netaddrlen) {
+            /* The destination hasn't been properly resolved yet, so retry resolution. Only pass up hard failures. */
+            if(!out_udp_init(selfptr)) return -1;
+        }
+
 	if(format == OFMT_TEXT || format == OFMT_JSON) {
 		out_udp_produce_text(self, metadata, msg);
 	} else if(format == OFMT_PP_ACARS) {
